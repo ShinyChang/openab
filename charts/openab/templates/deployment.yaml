@@ -91,8 +91,11 @@ spec:
             - name: HOME
               value: {{ $cfg.workingDir | default "/home/agent" }}
             {{- range $k, $v := $cfg.env }}
+            {{- /* skip literal "${VAR}" templates - envFrom provides the real value; openab broker substitutes ${VAR} in config.toml [agent].env */}}
+            {{- if not (regexMatch "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$" (toString $v)) }}
             - name: {{ $k }}
               value: {{ $v | quote }}
+            {{- end }}
             {{- end }}
             {{- include "openab.validateSecretEnv" (dict "secretEnv" $cfg.secretEnv "agentName" $name) }}
             {{- range $cfg.secretEnv }}
