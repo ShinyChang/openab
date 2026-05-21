@@ -223,6 +223,9 @@ data:
     {{- if hasKey ($cfg.gateway | default dict) "maxBatchTokens" }}
     max_batch_tokens = {{ ($cfg.gateway).maxBatchTokens | int }}
     {{- end }}
+    {{- if hasKey ($cfg.gateway) "streaming" }}
+    streaming = {{ ($cfg.gateway).streaming }}
+    {{- end }}
     {{- end }}
     {{- if or ($cfg.cronjobs) (($cfg.cron).usercronEnabled) (($cfg.cron).usercronPath) }}
 
