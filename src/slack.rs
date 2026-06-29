@@ -1385,7 +1385,21 @@ async fn handle_message(
                         debug!(filename, "adding image attachment");
                         extra_blocks.push(block);
                     }
-                    Err(media::MediaFetchError::NotAnImage) => {}
+                    Err(media::MediaFetchError::NotAnImage) => {
+                        if let Some(block) = media::download_to_disk(
+                            url,
+                            filename,
+                            mimetype,
+                            size,
+                            Some(bot_token),
+                            &ts,
+                        )
+                        .await
+                        {
+                            debug!(filename, "adding file attachment via disk path");
+                            extra_blocks.push(block);
+                        }
+                    }
                     Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
                         warn!(filename, actual, limit, "image exceeds size limit");
                         failed_image_files.push(filename.to_string());
