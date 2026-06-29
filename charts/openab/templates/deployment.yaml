@@ -29,6 +29,10 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with $cfg.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- $svcAcct := default $.Values.serviceAccountName $cfg.serviceAccountName }}
       {{- if $svcAcct }}
       serviceAccountName: {{ $svcAcct }}
@@ -48,7 +52,7 @@ spec:
           {{- if $cfg.configUrl }}
           args: ["openab", "run", "-c", {{ $cfg.configUrl | quote }}]
           {{- end }}
-          {{- with $.Values.containerSecurityContext }}
+          {{- with (default $.Values.containerSecurityContext $cfg.containerSecurityContext) }}
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
