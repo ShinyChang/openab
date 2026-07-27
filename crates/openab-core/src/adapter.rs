@@ -1319,6 +1319,14 @@ impl AdapterRouter {
 /// Interval between cosmetic streaming edits of the placeholder message.
 const COSMETIC_EDIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
 
+fn cosmetic_edit_interval() -> std::time::Duration {
+    std::env::var("OPENAB_STREAM_EDIT_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(COSMETIC_EDIT_INTERVAL)
+}
+
 /// Upper bound on how long finalize waits for an in-flight cosmetic edit to
 /// finish before it aborts the edit task. Gateway acked edits already give up
 /// after 800ms and fire-and-forget gateway edits return right after the socket
@@ -1357,7 +1365,7 @@ fn spawn_cosmetic_edit_loop(
                 // `has_changed()` errs once closed), but it could keep
                 // finalize's settle join waiting for up to one interval.
                 _ = async { while close_rx.changed().await.is_ok() {} } => break,
-                _ = tokio::time::sleep(COSMETIC_EDIT_INTERVAL) => {}
+                _ = tokio::time::sleep(cosmetic_edit_interval()) => {}
             }
             if buf_rx.has_changed().unwrap_or(false) {
                 let content = buf_rx.borrow_and_update().clone();

@@ -1560,6 +1560,14 @@ async fn handle_message(
                         message_id: ts.clone(),
                     };
                     let _ = adapter.add_reaction(&msg_ref, "🎤").await;
+                    // STT off otherwise drops the file; deliver audio to disk like other binaries so skills can read it.
+                    if let Some(block) =
+                        media::download_to_disk(url, filename, mimetype, size, Some(bot_token), &ts)
+                            .await
+                    {
+                        debug!(filename, "adding audio attachment via disk path");
+                        extra_blocks.push(block);
+                    }
                 }
             } else if media::is_text_file(filename, Some(mimetype)) {
                 if text_file_count >= TEXT_FILE_COUNT_CAP {
@@ -1634,7 +1642,20 @@ async fn handle_message(
                         extra_blocks.push(block);
                     }
                     Err(media::MediaFetchError::NotAnImage) => {
-                        if media::is_video_file(filename, Some(mimetype)) {
+                        // Skills read attachments by path (libreoffice/pandoc/ffmpeg), so disk wins over a URL.
+                        if let Some(block) = media::download_to_disk(
+                            url,
+                            filename,
+                            mimetype,
+                            size,
+                            Some(bot_token),
+                            &ts,
+                        )
+                        .await
+                        {
+                            debug!(filename, "adding file attachment via disk path");
+                            extra_blocks.push(block);
+                        } else if media::is_video_file(filename, Some(mimetype)) {
                             extra_blocks.push(ContentBlock::Text {
                                 text: format!(
                                     "[Video attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {}",
