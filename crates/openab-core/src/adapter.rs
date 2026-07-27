@@ -778,7 +778,12 @@ impl AdapterRouter {
                             let mut consecutive_failures: u32 = 0;
                             const MAX_CONSECUTIVE_FAILURES: u32 = 3;
                             loop {
-                                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    std::env::var("OPENAB_STREAM_EDIT_INTERVAL_MS")
+                                        .ok()
+                                        .and_then(|v| v.parse::<u64>().ok())
+                                        .unwrap_or(1500),
+                                )).await;
                                 if buf_rx.has_changed().unwrap_or(false) {
                                     let content = buf_rx.borrow_and_update().clone();
                                     if content != last {
