@@ -1548,7 +1548,7 @@ async fn handle_message(
                         }
                     }
                 } else {
-                    debug!(filename, "skipping audio attachment (STT disabled)");
+                    debug!(filename, "audio attachment not transcribed (STT disabled)");
                     let msg_ref = MessageRef {
                         channel: ChannelRef {
                             platform: "slack".into(),
@@ -1560,15 +1560,47 @@ async fn handle_message(
                         message_id: ts.clone(),
                     };
                     let _ = adapter.add_reaction(&msg_ref, "🎤").await;
-                    // STT off otherwise drops the file; deliver audio to disk like other binaries so skills can read it.
-                    if let Some(block) =
-                        media::download_to_disk(url, filename, mimetype, size, Some(bot_token), &ts)
-                            .await
-                    {
-                        debug!(filename, "adding audio attachment via disk path");
-                        extra_blocks.push(block);
-                    }
                 }
+
+                // Passthrough runs whichever way STT went: a transcript is an
+                // extra block, never a substitute for the file itself.
+                #[cfg(feature = "filestore")]
+                let stored: Option<(String, String)> = match filestore {
+                    Some(fs) => media::download_and_presign_attachment(
+                        url,
+                        filename,
+                        size,
+                        Some(mimetype),
+                        Some(bot_token),
+                        fs,
+                    )
+                    .await
+                    .map(|presigned| {
+                        (
+                            presigned,
+                            format!(
+                                "presigned URL, expires in {} minutes",
+                                fs.presigned_ttl_secs() / 60
+                            ),
+                        )
+                    }),
+                    None => None,
+                };
+                #[cfg(not(feature = "filestore"))]
+                let stored: Option<(String, String)> = None;
+
+                extra_blocks.push(match stored {
+                    Some((ref presigned, ref note)) => {
+                        media::audio_attachment_block(filename, mimetype, size, Some(presigned), Some(note))
+                    }
+                    None => media::audio_attachment_block(
+                        filename,
+                        mimetype,
+                        size,
+                        Some(url),
+                        Some("Slack private file, requires an `Authorization: Bearer <bot token>` header to download"),
+                    ),
+                });
             } else if media::is_text_file(filename, Some(mimetype)) {
                 if text_file_count >= TEXT_FILE_COUNT_CAP {
                     debug!(
@@ -1642,24 +1674,44 @@ async fn handle_message(
                         extra_blocks.push(block);
                     }
                     Err(media::MediaFetchError::NotAnImage) => {
-                        // Skills read attachments by path (libreoffice/pandoc/ffmpeg), so disk wins over a URL.
-                        if let Some(block) = media::download_to_disk(
-                            url,
-                            filename,
-                            mimetype,
-                            size,
-                            Some(bot_token),
-                            &ts,
-                        )
-                        .await
-                        {
-                            debug!(filename, "adding file attachment via disk path");
-                            extra_blocks.push(block);
-                        } else if media::is_video_file(filename, Some(mimetype)) {
+                        if media::is_video_file(filename, Some(mimetype)) {
+                            // url_private_download needs a bearer token the agent lacks, so a
+                            // presigned URL is the only fetchable form when a filestore exists.
+                            #[cfg(feature = "filestore")]
+                            let stored: Option<(String, String)> = match filestore {
+                                Some(fs) => media::download_and_presign_attachment(
+                                    url,
+                                    filename,
+                                    size,
+                                    Some(mimetype),
+                                    Some(bot_token),
+                                    fs,
+                                )
+                                .await
+                                .map(|presigned| {
+                                    (
+                                        presigned,
+                                        format!(
+                                            "presigned URL, expires in {} minutes",
+                                            fs.presigned_ttl_secs() / 60
+                                        ),
+                                    )
+                                }),
+                                None => None,
+                            };
+                            #[cfg(not(feature = "filestore"))]
+                            let stored: Option<(String, String)> = None;
+
+                            let (link, note) = match stored {
+                                Some((ref presigned, ref n)) => (presigned.as_str(), n.as_str()),
+                                None => (
+                                    url,
+                                    "Slack private file, requires an `Authorization: Bearer <bot token>` header to download",
+                                ),
+                            };
                             extra_blocks.push(ContentBlock::Text {
                                 text: format!(
-                                    "[Video attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {}",
-                                    filename, mimetype, size, url
+                                    "[Video attachment]\nfilename: {filename}\ncontent_type: {mimetype}\nsize_bytes: {size}\nurl: {link}\nnote: {note}"
                                 ),
                             });
                         } else {
