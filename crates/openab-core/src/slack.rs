@@ -1,5 +1,5 @@
 use crate::acp::ContentBlock;
-use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{truncate_chars, ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
@@ -174,6 +174,15 @@ impl SlackAdapter {
         let entry = map.get_mut(ts)?;
         entry.degraded_buf.push_str(delta);
         Some(entry.degraded_buf.clone())
+    }
+
+    /// Mark a native stream dead so the post+edit fallback takes over for the
+    /// rest of the turn, including `stream_finish`'s rescue branch.
+    async fn demote_stream(&self, ts: &str) {
+        let mut map = self.streams.lock().await;
+        if let Some(entry) = map.get_mut(ts) {
+            entry.active = false;
+        }
     }
 
     /// Get the bot's own Slack user ID (cached after first call).
@@ -620,6 +629,9 @@ impl ChatAdapter for SlackAdapter {
 
     async fn stream_append(&self, msg: &MessageRef, delta: &str) -> Result<()> {
         let ts = &msg.message_id;
+        // Accumulate even while the native stream is healthy: a mid-turn demotion
+        // has no other source for the text already streamed.
+        let cumulative = self.accumulate_degraded(ts, delta).await;
         let active = {
             let map = self.streams.lock().await;
             map.get(ts).map(|e| e.active).unwrap_or(false)
@@ -627,10 +639,20 @@ impl ChatAdapter for SlackAdapter {
         if active {
             let body = build_append_stream_body(&msg.channel.channel_id, ts, delta);
             if let Err(e) = self.api_post("chat.appendStream", body).await {
-                warn!(error = %e, "chat.appendStream failed (cosmetic; final replace will correct)");
+                if is_stream_closed(&e) {
+                    // Unsynced, the stale flag keeps every later append failing and
+                    // keeps stream_finish suppressing its rescue, losing the turn.
+                    warn!(error = %e, "stream closed by Slack; demoting to post+edit");
+                    self.demote_stream(ts).await;
+                    if let Some(c) = &cumulative {
+                        let _ = self.edit_message(msg, c).await;
+                    }
+                } else {
+                    warn!(error = %e, "chat.appendStream failed (cosmetic; final replace will correct)");
+                }
             }
-        } else if let Some(cumulative) = self.accumulate_degraded(ts, delta).await {
-            let _ = self.edit_message(msg, &cumulative).await; // cosmetic mid-stream
+        } else if let Some(c) = cumulative {
+            let _ = self.edit_message(msg, &c).await; // cosmetic mid-stream
         }
         Ok(())
     }
@@ -2025,10 +2047,20 @@ const MARKDOWN_BLOCK_LIMIT: usize = 11_900;
 /// Matches the Slack error *code* exactly (the trailing token of `api_post`'s
 /// `"Slack API <method>: <code>"` message), not a substring of the message —
 /// so a future code like `invalid_blocks_field` does not falsely match.
+/// True when Slack says the target message is no longer a live stream, so the
+/// caller must stop using the streaming API for this turn.
+fn is_stream_closed(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    let code = s.rsplit(": ").next().unwrap_or(s.as_str()).trim();
+    code == "message_not_in_streaming_state" || code == "message_not_found"
+}
+
 fn is_block_payload_rejected(e: &anyhow::Error) -> bool {
     let s = e.to_string();
     let code = s.rsplit(": ").next().unwrap_or(s.as_str()).trim();
-    code == "invalid_blocks" || code == "msg_blocks_too_long"
+    // `msg_too_long` is a backstop: the builders pre-truncate `text`, but the
+    // native-stream path has no postMessage rescue, so it must never hard-fail.
+    code == "invalid_blocks" || code == "msg_blocks_too_long" || code == "msg_too_long"
 }
 
 /// Build Block Kit `markdown` blocks from raw Markdown. Slack renders these
@@ -2054,6 +2086,13 @@ fn build_markdown_blocks(content: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// `text` has its own 4,000-char cap (`msg_too_long`), separate from the 12k
+/// blocks cap the router splits on; blocks carry the content, this is a preview.
+const TEXT_PREVIEW_LIMIT: usize = 300;
+
+/// Text-only degradation keeps the whole reply, so it only needs Slack's cap.
+const TEXT_FIELD_LIMIT: usize = 3_900;
+
 /// Body for `chat.postMessage`: Block Kit `markdown` blocks (rich rendering)
 /// plus a `text` fallback used for notifications and accessibility.
 fn build_post_message_body(
@@ -2064,7 +2103,7 @@ fn build_post_message_body(
     let mut body = serde_json::json!({
         "channel": channel_id,
         "blocks": build_markdown_blocks(content),
-        "text": markdown_to_mrkdwn(content),
+        "text": truncate_chars(&markdown_to_mrkdwn(content), TEXT_PREVIEW_LIMIT),
     });
     if let Some(ts) = thread_ts {
         body["thread_ts"] = serde_json::Value::String(ts.to_string());
@@ -2078,7 +2117,7 @@ fn build_update_body(channel_id: &str, ts: &str, content: &str) -> serde_json::V
         "channel": channel_id,
         "ts": ts,
         "blocks": build_markdown_blocks(content),
-        "text": markdown_to_mrkdwn(content),
+        "text": truncate_chars(&markdown_to_mrkdwn(content), TEXT_PREVIEW_LIMIT),
     })
 }
 
@@ -2091,7 +2130,7 @@ fn build_post_message_text_only(
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "channel": channel_id,
-        "text": markdown_to_mrkdwn(content),
+        "text": truncate_chars(&markdown_to_mrkdwn(content), TEXT_FIELD_LIMIT),
     });
     if let Some(ts) = thread_ts {
         body["thread_ts"] = serde_json::Value::String(ts.to_string());
@@ -2104,7 +2143,7 @@ fn build_update_text_only(channel_id: &str, ts: &str, content: &str) -> serde_js
     serde_json::json!({
         "channel": channel_id,
         "ts": ts,
-        "text": markdown_to_mrkdwn(content),
+        "text": truncate_chars(&markdown_to_mrkdwn(content), TEXT_FIELD_LIMIT),
     })
 }
 
@@ -2623,6 +2662,51 @@ mod tests {
             1,
             "table within message_limit must not be split mid-table"
         );
+    }
+
+    /// Slack rejects the whole call with `msg_too_long` past 4,000 chars of
+    /// `text`, which silently dropped the final answer on the native-stream path.
+    #[test]
+    fn block_bodies_cap_the_text_preview() {
+        let big = "x".repeat(50_000);
+        for body in [
+            build_post_message_body("C1", None, &big),
+            build_update_body("C1", "1700.1", &big),
+        ] {
+            let n = body["text"]
+                .as_str()
+                .expect("text fallback still present")
+                .chars()
+                .count();
+            assert!(n <= TEXT_PREVIEW_LIMIT, "len={n}");
+            assert!(
+                !body["blocks"].as_array().unwrap().is_empty(),
+                "blocks still carry the real content"
+            );
+        }
+    }
+
+    #[test]
+    fn text_only_bodies_stay_under_slacks_text_cap() {
+        let big = "x".repeat(50_000);
+        for body in [
+            build_post_message_text_only("C1", None, &big),
+            build_update_text_only("C1", "1700.1", &big),
+        ] {
+            let n = body["text"].as_str().unwrap().chars().count();
+            assert!(n <= TEXT_FIELD_LIMIT, "len={n}");
+            assert!(n < 4_000, "must stay under Slack's hard cap");
+        }
+    }
+
+    #[test]
+    fn stream_closed_classifier_matches_both_slack_codes() {
+        for code in ["message_not_in_streaming_state", "message_not_found"] {
+            let e = anyhow::anyhow!("Slack API chat.appendStream: {code}");
+            assert!(is_stream_closed(&e), "should demote on {code}");
+        }
+        let other = anyhow::anyhow!("Slack API chat.appendStream: ratelimited");
+        assert!(!is_stream_closed(&other), "ratelimited is retryable");
     }
 
     /// Text-only fallback bodies carry `text` and no `blocks` — used when a

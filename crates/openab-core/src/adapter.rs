@@ -1369,11 +1369,26 @@ fn contains_bot_mention(content: &str) -> bool {
 }
 
 /// Flatten a tool-call title into a single line safe for inline-code spans.
+/// A Bash title is the whole shell command; uncapped, tool lines push the
+/// finalized message past Slack's 4,000-char `text` cap and the answer is lost.
+const TOOL_TITLE_LIMIT: usize = 80;
+
 fn sanitize_title(title: &str) -> String {
-    title
+    let cleaned = title
         .replace('\r', "")
         .replace('\n', " ; ")
-        .replace('`', "'")
+        .replace('`', "'");
+    truncate_chars(&cleaned, TOOL_TITLE_LIMIT)
+}
+
+/// Counts characters, not bytes: a byte split would panic mid-codepoint.
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1578,8 +1593,19 @@ fn compose_display(
                             out.push('\n');
                         }
                     }
-                } else {
+                } else if groups.len() <= TOOL_COLLAPSE_THRESHOLD {
                     for (t, s, n) in &groups {
+                        out.push_str(&render_group(t, *s, *n));
+                        out.push('\n');
+                    }
+                } else {
+                    // Same cap as the streaming preview: uncapped, a long turn's
+                    // tool lines evict the answer past Slack's 4,000-char limit.
+                    let hidden_groups = groups.len() - TOOL_COLLAPSE_THRESHOLD;
+                    let hidden_calls: usize =
+                        groups.iter().take(hidden_groups).map(|(_, _, n)| *n).sum();
+                    out.push_str(&format!("🔧 {hidden_calls} more\n"));
+                    for (t, s, n) in groups.iter().skip(hidden_groups) {
                         out.push_str(&render_group(t, *s, *n));
                         out.push('\n');
                     }
@@ -1957,6 +1983,57 @@ mod tests {
         )];
         let out = compose_display(&tools, "done", false, ToolDisplay::Full);
         assert!(out.contains("`curl -s https://example.com`"));
+    }
+
+    #[test]
+    fn sanitize_title_truncates_a_long_shell_command() {
+        let long = format!("curl -s {}", "a".repeat(300));
+        let out = sanitize_title(&long);
+        assert!(out.chars().count() <= TOOL_TITLE_LIMIT, "output: {out}");
+        assert!(out.ends_with('…'), "expected ellipsis marker: {out}");
+    }
+
+    #[test]
+    fn sanitize_title_leaves_a_short_title_untouched() {
+        assert_eq!(sanitize_title("grep -r pat src/"), "grep -r pat src/");
+    }
+
+    #[test]
+    fn sanitize_title_truncates_on_char_not_byte_boundary() {
+        // A byte split inside a multi-byte codepoint would panic.
+        let out = sanitize_title(&"漢".repeat(200));
+        assert!(out.chars().count() <= TOOL_TITLE_LIMIT, "output: {out}");
+    }
+
+    #[test]
+    fn compose_display_full_final_collapses_beyond_threshold() {
+        // The finalized message (streaming = false) is what the user reads; before
+        // this cap a long turn's tool lines pushed the answer past Slack's limit.
+        let tools = vec![
+            tool("1", "aaa", ToolState::Completed),
+            tool("2", "bbb", ToolState::Completed),
+            tool("3", "ccc", ToolState::Completed),
+            tool("4", "ddd", ToolState::Completed),
+            tool("5", "eee", ToolState::Completed),
+        ];
+        let out = compose_display(&tools, "done", false, ToolDisplay::Full);
+        assert!(out.contains("🔧 2 more"), "expected hidden summary: {out}");
+        assert!(!out.contains("`aaa`"), "oldest groups hidden: {out}");
+        assert!(out.contains("`eee`"), "newest groups kept: {out}");
+        assert!(out.contains("done"), "answer text must survive: {out}");
+    }
+
+    #[test]
+    fn compose_display_full_final_at_threshold_still_shows_every_line() {
+        let tools = vec![
+            tool("1", "aaa", ToolState::Completed),
+            tool("2", "bbb", ToolState::Completed),
+            tool("3", "ccc", ToolState::Completed),
+        ];
+        let out = compose_display(&tools, "done", false, ToolDisplay::Full);
+        assert!(!out.contains("more"), "no collapse at threshold: {out}");
+        assert!(out.contains("`aaa`"), "output: {out}");
+        assert!(out.contains("`ccc`"), "output: {out}");
     }
 
     #[test]
