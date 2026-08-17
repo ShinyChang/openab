@@ -180,6 +180,30 @@ pub async fn download_and_encode_image(
     size: u64,
     auth_token: Option<&str>,
 ) -> Result<ContentBlock, MediaFetchError> {
+    #[cfg(feature = "filestore")]
+    let result = download_and_encode_image_with_passthrough(
+        url, mime_hint, filename, size, auth_token, None,
+    )
+    .await;
+    #[cfg(not(feature = "filestore"))]
+    let result =
+        download_and_encode_image_with_passthrough(url, mime_hint, filename, size, auth_token)
+            .await;
+    result.map(|(inline, _)| inline)
+}
+
+/// [`download_and_encode_image`] plus a presigned URL for the ORIGINAL bytes when a
+/// filestore is configured. The inline block is downscaled and re-encoded, so a caller
+/// whose platform URL needs credentials the agent lacks (Slack `url_private`) has no
+/// other way to hand over a file the agent can actually open.
+pub async fn download_and_encode_image_with_passthrough(
+    url: &str,
+    mime_hint: Option<&str>,
+    filename: &str,
+    size: u64,
+    auth_token: Option<&str>,
+    #[cfg(feature = "filestore")] filestore: Option<&crate::filestore::Filestore>,
+) -> Result<(ContentBlock, Option<String>), MediaFetchError> {
     const MAX_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 
     if url.is_empty() {
@@ -295,11 +319,25 @@ pub async fn download_and_encode_image(
         "image processed"
     );
 
+    // The original `bytes`, never `output_bytes`: the inline copy is capped at 1200px JPEG,
+    // so masking or embedding needs the untouched file. After validation, so an HTTP-200
+    // error page never lands in the store.
+    #[cfg(feature = "filestore")]
+    let passthrough = match filestore {
+        Some(fs) => upload_bytes_and_presign(filename, &bytes, fs).await,
+        None => None,
+    };
+    #[cfg(not(feature = "filestore"))]
+    let passthrough: Option<String> = None;
+
     let encoded = BASE64.encode(&output_bytes);
-    Ok(ContentBlock::Image {
-        media_type: output_mime,
-        data: encoded,
-    })
+    Ok((
+        ContentBlock::Image {
+            media_type: output_mime,
+            data: encoded,
+        },
+        passthrough,
+    ))
 }
 
 /// Download an audio file and transcribe it via the configured STT provider.
@@ -403,6 +441,29 @@ pub fn audio_attachment_block(
     url: Option<&str>,
     note: Option<&str>,
 ) -> ContentBlock {
+    attachment_block("Audio attachment", filename, content_type, size, url, note)
+}
+
+/// Same shape as the audio block, so an image's fetchable location reads alike on
+/// every adapter: Discord emits this next to the inline image with its CDN URL.
+pub fn image_attachment_block(
+    filename: &str,
+    content_type: &str,
+    size: u64,
+    url: Option<&str>,
+    note: Option<&str>,
+) -> ContentBlock {
+    attachment_block("Image attachment", filename, content_type, size, url, note)
+}
+
+fn attachment_block(
+    kind: &str,
+    filename: &str,
+    content_type: &str,
+    size: u64,
+    url: Option<&str>,
+    note: Option<&str>,
+) -> ContentBlock {
     // Attachment names are user-controlled and land verbatim in the prompt.
     let safe_filename: String = filename
         .chars()
@@ -421,7 +482,7 @@ pub fn audio_attachment_block(
     };
 
     let mut text = format!(
-        "[Audio attachment]\nfilename: {safe_filename}\ncontent_type: {safe_mime}\nsize_bytes: {size}"
+        "[{kind}]\nfilename: {safe_filename}\ncontent_type: {safe_mime}\nsize_bytes: {size}"
     );
     if let Some(url) = url {
         text.push_str(&format!("\nurl: {url}"));
@@ -898,11 +959,11 @@ pub async fn upload_bytes_and_presign(
 
     match filestore.upload_and_presign(filename, bytes).await {
         Ok(presigned_url) => {
-            tracing::info!(filename, size = actual_size, "audio uploaded to filestore");
+            tracing::info!(filename, size = actual_size, "bytes uploaded to filestore");
             Some(presigned_url)
         }
         Err(e) => {
-            tracing::error!(filename, error = %e, "filestore upload failed (audio passthrough)");
+            tracing::error!(filename, error = %e, "filestore upload failed (bytes passthrough)");
             None
         }
     }
@@ -1438,6 +1499,28 @@ mod tests {
             panic!("audio attachments must be forwarded as text metadata");
         };
         text
+    }
+
+    #[test]
+    fn image_attachment_block_carries_the_fetchable_original() {
+        let text = block_text(image_attachment_block(
+            "slide.png",
+            "image/png",
+            2_097_152,
+            Some("https://example.s3.amazonaws.com/slide.png?X-Amz-Signature=abc"),
+            Some("presigned URL, expires in 60 minutes; serves the original file"),
+        ));
+
+        assert!(text.contains("[Image attachment]"));
+        assert!(text.contains("filename: slide.png"));
+        assert!(text.contains("content_type: image/png"));
+        assert!(text.contains("size_bytes: 2097152"));
+        assert!(
+            text.contains("url: https://example.s3.amazonaws.com/slide.png?X-Amz-Signature=abc")
+        );
+        assert!(
+            text.contains("note: presigned URL, expires in 60 minutes; serves the original file")
+        );
     }
 
     #[test]
