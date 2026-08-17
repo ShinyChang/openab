@@ -1682,18 +1682,50 @@ async fn handle_message(
                     extra_blocks.push(block);
                 }
             } else {
-                match media::download_and_encode_image(
+                #[cfg(feature = "filestore")]
+                let presigned_note = filestore.map(|fs| {
+                    format!(
+                        "presigned URL, expires in {} minutes; serves the original file, \
+                         while the inline copy above is downscaled",
+                        fs.presigned_ttl_secs() / 60
+                    )
+                });
+                #[cfg(not(feature = "filestore"))]
+                let presigned_note: Option<String> = None;
+
+                #[cfg(feature = "filestore")]
+                let image_result = media::download_and_encode_image_with_passthrough(
+                    url,
+                    Some(mimetype),
+                    filename,
+                    size,
+                    Some(bot_token),
+                    filestore,
+                )
+                .await;
+                #[cfg(not(feature = "filestore"))]
+                let image_result = media::download_and_encode_image_with_passthrough(
                     url,
                     Some(mimetype),
                     filename,
                     size,
                     Some(bot_token),
                 )
-                .await
-                {
-                    Ok(block) => {
+                .await;
+
+                match image_result {
+                    Ok((block, presigned)) => {
                         debug!(filename, "adding image attachment");
                         extra_blocks.push(block);
+                        if let Some(ref presigned) = presigned {
+                            extra_blocks.push(media::image_attachment_block(
+                                filename,
+                                mimetype,
+                                size,
+                                Some(presigned),
+                                presigned_note.as_deref(),
+                            ));
+                        }
                     }
                     Err(media::MediaFetchError::NotAnImage) => {
                         if media::is_video_file(filename, Some(mimetype)) {
