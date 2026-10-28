@@ -65,7 +65,7 @@ pub fn poll_streaming_delta(
     };
 
     let mut stmt = match conn.prepare(
-        "SELECT idx, step_type, step_payload FROM steps WHERE idx > ?1 AND (step_type = 15 OR step_type IN (5,7,8,9,17,21,33,101,138)) ORDER BY idx"
+        "SELECT idx, step_type, step_payload FROM steps WHERE idx > ?1 AND (step_type = 15 OR step_type IN (5,7,8,9,17,21,33,101,132,138)) ORDER BY idx"
     ) {
         Ok(s) => s,
         Err(_) => return Vec::new(),

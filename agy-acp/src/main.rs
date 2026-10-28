@@ -1189,6 +1189,42 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    #[ignore]
+    fn test_streaming_poll_emits_tool_call_for_step_type_132() {
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-tool-{}", Uuid::new_v4())));
+        let conv_dir = root.join("conversations");
+        fs::create_dir_all(&conv_dir).unwrap();
+        let conn = Connection::open(conv_dir.join("tool-conv.db")).unwrap();
+        conn.execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL DEFAULT 0, status INTEGER NOT NULL DEFAULT 0, has_subtrajectory NUMERIC NOT NULL DEFAULT 0, metadata BLOB, error_details BLOB, permissions BLOB, task_details BLOB, render_info BLOB, step_payload BLOB, step_format INTEGER NOT NULL DEFAULT 0)").unwrap();
+        fn field(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            let mut len = body.len();
+            loop { if len < 128 { out.push(len as u8); break; } out.push((len as u8 & 0x7F) | 0x80); len >>= 7; }
+            out.extend_from_slice(body);
+            out
+        }
+        // agy 1.4 records run_command / read_file as step_type 132, same field 5 -> 4 -> {2: name, 3: input} layout.
+        let call = [field(0x12, b"run_command"), field(0x1A, br#"{"CommandLine":"date -u"}"#)].concat();
+        let payload = field(0x2A, &field(0x22, &call));
+        conn.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 132, ?2)", rusqlite::params![2i64, payload]).unwrap();
+        let state = Arc::new(Mutex::new(StreamingState {
+            conversation_id: Some("tool-conv".to_string()), base_step_idx: -1, last_step_idx: -1,
+            emitted_len: HashMap::new(), emitted_tool_steps: HashSet::new(), had_updates: false,
+        }));
+        let lines = streaming::poll_streaming_delta(&conv_dir, None, "sess-1", &state);
+        assert_eq!(lines.len(), 2);
+        let start: Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(start["params"]["update"]["sessionUpdate"], "tool_call");
+        assert_eq!(start["params"]["update"]["title"], "run_command: date -u");
+    }
+
+    #[test]
+    fn test_tool_call_title_reads_capitalised_path_key() {
+        let input = Some(json!({"Path": "/etc/os-release"}));
+        assert_eq!(protobuf::tool_call_title("read_file", &input), "read_file: /etc/os-release");
+    }
+
     fn prepare_auth() -> bool {
         if std::env::var("GEMINI_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) { return true; }
         let home = std::env::var("HOME").unwrap_or_default();

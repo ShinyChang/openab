@@ -60,7 +60,7 @@ pub fn get_proto_text(blob: &[u8], target: u64) -> Option<String> {
 
 /// Check if a step_type represents a tool call.
 pub fn is_tool_step_type(step_type: i64) -> bool {
-    matches!(step_type, 5 | 7 | 8 | 9 | 17 | 21 | 33 | 101 | 138)
+    matches!(step_type, 5 | 7 | 8 | 9 | 17 | 21 | 33 | 101 | 132 | 138)
 }
 
 /// Extract tool name and input from a tool step payload.
@@ -78,12 +78,12 @@ pub fn extract_tool_from_step_payload(blob: &[u8]) -> Option<(String, Option<Val
 /// Derive a short title for a tool call based on name and input.
 pub fn tool_call_title(name: &str, input: &Option<Value>) -> String {
     if let Some(input) = input {
-        for key in ["path", "file", "AbsolutePath", "FilePath"] {
+        for key in ["path", "Path", "file", "AbsolutePath", "FilePath"] {
             if let Some(path) = input.get(key).and_then(|v| v.as_str()) {
                 return format!("{}: {}", name, path);
             }
         }
-        for key in ["query", "command", "text"] {
+        for key in ["query", "command", "CommandLine", "text"] {
             if let Some(val) = input.get(key).and_then(|v| v.as_str()) {
                 let truncated: String = val.chars().take(60).collect();
                 return format!("{}: {}", name, truncated);
