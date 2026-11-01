@@ -1097,7 +1097,7 @@ impl EventHandler for Handler {
                 .join(", ");
             let warn_msg = format!(
                 ":warning: I couldn't process the image(s) you shared ({}). \
-                 The files may be inaccessible or in an unsupported format (PNG/JPEG/GIF/WebP only).",
+                 The files may be inaccessible or in an unsupported format (PNG/JPEG/GIF/WebP/HEIC only).",
                 file_list
             );
             if let Err(e) = adapter.send_message(&thread_channel, &warn_msg).await {

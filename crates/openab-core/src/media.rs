@@ -4,8 +4,13 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder, ImageReader};
+use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::io::Cursor;
+use std::process::Stdio;
 use std::sync::LazyLock;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, warn};
 
 /// Reusable HTTP client for downloading attachments (shared across adapters).
@@ -21,6 +26,14 @@ const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
 
 /// JPEG quality for compressed output.
 const IMAGE_JPEG_QUALITY: u8 = 75;
+
+/// `ftyp` major brands of HEVC-coded HEIF, which the `image` crate cannot decode.
+const HEIF_BRANDS: [&[u8; 4]; 10] = [
+    b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"hevm", b"hevs", b"mif1", b"msf1",
+];
+
+/// Attachments are handled in the adapter's message path, so a stuck decode must not hold it.
+const HEIF_DECODE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Maximum file size (in bytes) for inline text content in prompts.
 /// Files larger than this are routed to the filestore (when configured)
@@ -161,6 +174,82 @@ fn validate_gif_body(raw: &[u8]) -> image::ImageResult<()> {
     Ok(())
 }
 
+fn is_heif_body(body: &[u8]) -> bool {
+    body.get(4..8) == Some(b"ftyp".as_slice())
+        && body
+            .get(8..12)
+            .is_some_and(|brand| HEIF_BRANDS.iter().any(|b| b.as_slice() == brand))
+}
+
+/// A child process so a fault in a native decoder parsing an untrusted upload cannot take the
+/// broker down. Its environment is cleared because a decoder has no use for the broker's tokens.
+async fn pipe_through(
+    program: &str,
+    args: &[&str],
+    env: &[(&str, &OsStr)],
+    input: &[u8],
+    limit: Duration,
+) -> std::io::Result<Vec<u8>> {
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let (mut output, mut diagnostics) = (Vec::new(), Vec::new());
+    let feed = async move {
+        // A decoder that rejects the body exits without reading it; its exit status says so.
+        let _ = stdin.write_all(input).await;
+    };
+    let run = async {
+        tokio::join!(
+            feed,
+            stdout.read_to_end(&mut output),
+            stderr.read_to_end(&mut diagnostics),
+            child.wait()
+        )
+    };
+    let Ok((_, read_stdout, read_stderr, status)) = tokio::time::timeout(limit, run).await else {
+        let _ = child.kill().await;
+        let message = format!("{program} timed out");
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, message));
+    };
+    read_stdout?;
+    read_stderr?;
+    if !status?.success() {
+        let message = String::from_utf8_lossy(&diagnostics);
+        return Err(std::io::Error::other(message.trim().to_string()));
+    }
+    Ok(output)
+}
+
+/// `heic:` pins the coder so an untrusted body cannot be sniffed into another one. No orientation
+/// flag: libheif already applies the file's rotation while decoding.
+async fn heif_to_jpeg(filename: &str, body: &[u8]) -> Result<Vec<u8>, MediaFetchError> {
+    let invalid = |e: std::io::Error| {
+        error!(filename, error = %e, "HEIF decode failed");
+        MediaFetchError::InvalidImageBody {
+            magic_prefix_hex: hex_prefix(body),
+        }
+    };
+    // ImageMagick spools stdin to a temp file that a kill on timeout would leave behind.
+    let scratch = std::env::temp_dir().join(format!("openab-heif-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir(&scratch).await.map_err(invalid)?;
+    let resize = format!("{IMAGE_MAX_DIMENSION_PX}x{IMAGE_MAX_DIMENSION_PX}>");
+    let args = ["heic:-", "-resize", &resize, "-quality", "92", "jpeg:-"];
+    let env = [("MAGICK_TEMPORARY_PATH", scratch.as_os_str())];
+    let decoded = pipe_through("convert", &args, &env, body, HEIF_DECODE_TIMEOUT).await;
+    let _ = tokio::fs::remove_dir_all(&scratch).await;
+    decoded.map_err(invalid)
+}
+
 /// Download an image from a URL, resize/compress it, and return as a ContentBlock.
 ///
 /// Returns `Err(MediaFetchError::NotAnImage)` when the URL or MIME hint don't
@@ -219,6 +308,7 @@ pub async fn download_and_encode_image_with_passthrough(
                 "jpg" | "jpeg" => Some("image/jpeg"),
                 "gif" => Some("image/gif"),
                 "webp" => Some("image/webp"),
+                "heic" | "heif" => Some("image/heic"),
                 _ => None,
             })
     });
@@ -285,9 +375,16 @@ pub async fn download_and_encode_image_with_passthrough(
         });
     }
 
+    // Only the inline copy changes format; the passthrough below keeps the original `bytes`.
+    let decodable = if is_heif_body(&bytes) {
+        Cow::Owned(heif_to_jpeg(filename, &bytes).await?)
+    } else {
+        Cow::Borrowed(&bytes[..])
+    };
+
     // Guard against HTTP 200 responses that are error pages (e.g. Slack auth redirect
     // when files:read scope is missing), and against corrupted or mislabeled bodies.
-    if let Err(e) = validate_image_response(content_type.as_deref(), &bytes) {
+    if let Err(e) = validate_image_response(content_type.as_deref(), &decodable) {
         error!(
             filename,
             mime_hint = mime,
@@ -299,7 +396,7 @@ pub async fn download_and_encode_image_with_passthrough(
         return Err(e);
     }
 
-    let (output_bytes, output_mime) = match resize_and_compress(&bytes) {
+    let (output_bytes, output_mime) = match resize_and_compress(&decodable) {
         Ok(result) => result,
         Err(e) => {
             error!(
@@ -1578,5 +1675,88 @@ mod tests {
         let text = block_text(audio_attachment_block("clip.wav", "", 10, None, None));
 
         assert!(text.contains("content_type: unknown"));
+    }
+
+    fn ftyp_body(brand: &[u8]) -> Vec<u8> {
+        [&[0, 0, 0, 24], b"ftyp".as_slice(), brand, &[0; 64]].concat()
+    }
+
+    #[test]
+    fn heif_is_recognised_from_the_body_not_the_label() {
+        for brand in HEIF_BRANDS {
+            assert!(is_heif_body(&ftyp_body(brand)));
+        }
+        assert!(!is_heif_body(&ftyp_body(b"isom")), "mp4 shares the ftyp box");
+        assert!(!is_heif_body(&ftyp_body(b"avif")));
+        let brand_outside_ftyp = [&[0, 0, 0, 24], b"free".as_slice(), b"heic", &[0; 8]].concat();
+        assert!(!is_heif_body(&brand_outside_ftyp));
+        assert!(!is_heif_body(&make_png(1, 1)));
+        assert!(!is_heif_body(b"\0\0\0\x18ftyp"), "truncated before the brand");
+        assert!(!is_heif_body(b""));
+    }
+
+    #[tokio::test]
+    async fn undecodable_heif_takes_the_invalid_image_path_and_cleans_up() {
+        let result = heif_to_jpeg("broken.heic", &ftyp_body(b"heic")).await;
+        assert!(matches!(
+            result,
+            Err(MediaFetchError::InvalidImageBody { .. })
+        ));
+        let leftovers = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("openab-heif-"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[tokio::test]
+    async fn pipe_through_does_not_stall_on_more_than_a_pipe_buffer() {
+        let input = vec![7u8; 1024 * 1024];
+        let output = pipe_through("cat", &[], &[], &input, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(output, input);
+    }
+
+    #[tokio::test]
+    async fn pipe_through_gives_up_on_a_hung_decoder_and_kills_it() {
+        let marker = std::env::temp_dir().join(format!("openab-hung-{}", std::process::id()));
+        let marker_arg = marker.to_str().unwrap();
+        let script = "sleep 1; : > \"$0\"";
+        let started = std::time::Instant::now();
+        let error = pipe_through(
+            "sh",
+            &["-c", script, marker_arg],
+            &[],
+            b"",
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(900));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!marker.exists(), "the decoder outlived its timeout");
+    }
+
+    #[tokio::test]
+    async fn pipe_through_surfaces_a_failing_decoder() {
+        let script = "echo bad image >&2; exit 1";
+        let error = pipe_through("sh", &["-c", script], &[], b"", Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("bad image"));
+    }
+
+    #[tokio::test]
+    async fn pipe_through_passes_only_the_environment_it_was_given() {
+        std::env::set_var("OPENAB_TEST_BROKER_SECRET", "leaked");
+        let script = "printf %s \"$OPENAB_TEST_BROKER_SECRET$OPENAB_TEST_GIVEN\"";
+        let env = [("OPENAB_TEST_GIVEN", OsStr::new("given"))];
+        let output = pipe_through("sh", &["-c", script], &env, b"", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(output, b"given");
     }
 }

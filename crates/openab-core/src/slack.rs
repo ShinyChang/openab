@@ -1835,7 +1835,7 @@ async fn handle_message(
         let msg = format!(
             ":warning: I couldn't process the file(s) you shared (`{file_list}`). \
              This can happen when the bot lacks the `files:read` OAuth scope, \
-             the file format isn't supported (PNG/JPEG/GIF/WebP only), \
+             the file format isn't supported (PNG/JPEG/GIF/WebP/HEIC only), \
              or the file is too large."
         );
         if let Err(e) = adapter.send_message(&warn_channel, &msg).await {
