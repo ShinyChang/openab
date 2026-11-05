@@ -1434,6 +1434,7 @@ struct AgentConfigRaw {
     working_dir: String,
     env: HashMap<String, String>,
     inherit_env: Vec<String>,
+    mcp_servers: Vec<serde_json::Value>,
 }
 
 impl Default for AgentConfigRaw {
@@ -1444,6 +1445,7 @@ impl Default for AgentConfigRaw {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -1455,6 +1457,9 @@ pub struct AgentConfig {
     pub working_dir: String,
     pub env: HashMap<String, String>,
     pub inherit_env: Vec<String>,
+    /// ACP `mcpServers` for every session/new and session/load: claude-agent-acp runs claude
+    /// with --strict-mcp-config, so the agent's own MCP config is never loaded.
+    pub mcp_servers: Vec<serde_json::Value>,
     /// Whether the command was explicitly set in config (vs defaulted from env/fallback).
     pub command_explicit: bool,
 }
@@ -1467,6 +1472,7 @@ impl Default for AgentConfig {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            mcp_servers: Vec::new(),
             command_explicit: false,
         }
     }
@@ -1493,6 +1499,7 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
             working_dir: raw.working_dir,
             env: raw.env,
             inherit_env: raw.inherit_env,
+            mcp_servers: raw.mcp_servers,
             command_explicit: cmd_explicit,
         })
     }
@@ -2072,6 +2079,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 working_dir: config.agent.working_dir.clone(),
                 env: config.agent.env.clone(),
                 inherit_env: config.agent.inherit_env.clone(),
+                mcp_servers: config.agent.mcp_servers.clone(),
                 command_explicit: true, // synthesized counts as explicit
             };
         }
@@ -3113,6 +3121,39 @@ command = "echo"
         assert_eq!(cfg.agent.command, "echo");
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
+        assert!(cfg.agent.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn parse_agent_mcp_servers_in_acp_shape() {
+        std::env::set_var("AB_TEST_MCP_TOKEN", "secret");
+        let cfg = parse_config(
+            r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[[agent.mcp_servers]]
+type = "http"
+name = "shy"
+url = "http://relay/mcp"
+headers = [{ name = "Authorization", value = "Bearer ${AB_TEST_MCP_TOKEN}" }]
+"#,
+            "test",
+        )
+        .unwrap();
+        std::env::remove_var("AB_TEST_MCP_TOKEN");
+        assert_eq!(
+            cfg.agent.mcp_servers,
+            vec![serde_json::json!({
+                "type": "http",
+                "name": "shy",
+                "url": "http://relay/mcp",
+                "headers": [{"name": "Authorization", "value": "Bearer secret"}],
+            })]
+        );
     }
 
     #[test]
