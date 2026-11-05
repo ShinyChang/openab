@@ -17,6 +17,17 @@ const GATEWAY_REPLY_TIMEOUT_SECS: u64 = 5;
 /// timeout is an error because the adapter promised a delivery response.
 const ACKED_GATEWAY_REPLY_TIMEOUT_SECS: u64 = 35;
 
+/// A proxy in between (Docker's `host.docker.internal`) can hold core's side of a
+/// dead connection open with no Close, so only silence past the idle timeout shows it.
+const GATEWAY_PING_INTERVAL_SECS: u64 = 30;
+const GATEWAY_IDLE_TIMEOUT_SECS: u64 = 75;
+/// A ping stuck behind a full send buffer must not stall the read loop.
+const GATEWAY_PING_SEND_TIMEOUT_SECS: u64 = 10;
+
+fn gateway_idle(since_last_inbound: std::time::Duration, timeout: std::time::Duration) -> bool {
+    since_last_inbound >= timeout
+}
+
 /// Platforms whose gateway adapter emits a `GatewayResponse` for `edit_message`
 /// so core can observe edit success or failure (used to gate the per-edit
 /// response-wait below).
@@ -912,9 +923,17 @@ pub async fn run_gateway_adapter(
             bot_username: bot_username.as_deref(),
         };
 
+        let mut ping_interval =
+            tokio::time::interval(std::time::Duration::from_secs(GATEWAY_PING_INTERVAL_SECS));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_inbound = std::time::Instant::now();
+
         loop {
             tokio::select! {
                     msg = ws_rx.next() => {
+                        if let Some(Ok(_)) = &msg {
+                            last_inbound = std::time::Instant::now();
+                        }
                         match msg {
                             Some(Ok(Message::Text(text))) => {
                                 let text_str: &str = &text;
@@ -1306,6 +1325,35 @@ pub async fn run_gateway_adapter(
                             break;
                         }
                         _ => {}
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    if gateway_idle(
+                        last_inbound.elapsed(),
+                        std::time::Duration::from_secs(GATEWAY_IDLE_TIMEOUT_SECS),
+                    ) {
+                        warn!(
+                            idle_secs = last_inbound.elapsed().as_secs(),
+                            "gateway silent past the idle timeout, will reconnect"
+                        );
+                        break;
+                    }
+                    let ping = async { ws_tx.lock().await.send(Message::Ping(Vec::new())).await };
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(GATEWAY_PING_SEND_TIMEOUT_SECS),
+                        ping,
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            error!("gateway ping failed: {e}, will reconnect");
+                            break;
+                        }
+                        Err(_) => {
+                            error!("gateway ping could not be sent, will reconnect");
+                            break;
+                        }
                     }
                 }
                 _ = shutdown_rx.changed() => {
@@ -1819,6 +1867,22 @@ fn format_size(n: u64) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn gateway_counts_as_idle_from_the_timeout_on() {
+        use std::time::Duration;
+        let timeout = Duration::from_secs(GATEWAY_IDLE_TIMEOUT_SECS);
+        assert!(!gateway_idle(Duration::ZERO, timeout));
+        assert!(!gateway_idle(Duration::from_secs(GATEWAY_IDLE_TIMEOUT_SECS - 1), timeout));
+        assert!(gateway_idle(timeout, timeout));
+        assert!(gateway_idle(Duration::from_secs(GATEWAY_IDLE_TIMEOUT_SECS + 10), timeout));
+    }
+
+    #[test]
+    fn idle_timeout_outlasts_two_missed_pings() {
+        // One late pong must not drop a healthy connection.
+        assert!(GATEWAY_IDLE_TIMEOUT_SECS > 2 * GATEWAY_PING_INTERVAL_SECS);
+    }
 
     #[test]
     fn line_cannot_stream_and_is_forced_send_once() {
