@@ -590,7 +590,9 @@ impl SessionPool {
         let mut load_failed: Option<&str> = None;
         if let Some(ref sid) = saved_session_id {
             if new_conn.supports_load_session {
-                match new_conn.session_load(sid, &effective_workdir).await {
+                match new_conn
+                    .session_load(sid, &effective_workdir, &self.config.mcp_servers)
+                    .await {
                     Ok(()) => {
                         info!(thread_id = %crate::redact::redact_session_ids(thread_id), session_id = %crate::redact::redact_session_ids(sid), "session resumed via session/load");
                         resumed = true;
@@ -627,7 +629,9 @@ impl SessionPool {
         }
 
         if !resumed {
-            new_conn.session_new(&effective_workdir).await?;
+            new_conn
+                .session_new(&effective_workdir, &self.config.mcp_servers)
+                .await?;
 
             // Apply default config options (e.g. mode=bypass, model=swe-1-6)
             for (config_id, value) in &self.default_config_options {

@@ -603,9 +603,16 @@ impl AcpConnection {
         Ok(())
     }
 
-    pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
+    pub async fn session_new(
+        &mut self,
+        cwd: &str,
+        mcp_servers: &[serde_json::Value],
+    ) -> Result<String> {
         let resp = self
-            .send_request("session/new", Some(json!({"cwd": cwd, "mcpServers": []})))
+            .send_request(
+                "session/new",
+                Some(json!({"cwd": cwd, "mcpServers": mcp_servers})),
+            )
             .await?;
 
         let session_id = resp
@@ -818,11 +825,16 @@ impl AcpConnection {
 
     /// Resume a previous session by ID. Returns Ok(()) if the agent accepted
     /// the load, or an error if it failed (caller should fall back to session/new).
-    pub async fn session_load(&mut self, session_id: &str, cwd: &str) -> Result<()> {
+    pub async fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: &[serde_json::Value],
+    ) -> Result<()> {
         let resp = self
             .send_request(
                 "session/load",
-                Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []})),
+                Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers})),
             )
             .await?;
         // Accept any non-error response as success
