@@ -789,6 +789,13 @@ impl SessionPool {
         conn.config_options.clone()
     }
 
+    /// The slash commands the session's agent last offered, as ACP `availableCommands`.
+    pub async fn get_available_commands(&self, thread_id: &str) -> Option<serde_json::Value> {
+        let conn = self.state.read().await.active.get(thread_id)?.clone();
+        let conn = conn.lock().await;
+        conn.available_commands()
+    }
+
     /// Set a config option (e.g. model) via ACP and return updated options.
     pub async fn set_config_option(
         &self,

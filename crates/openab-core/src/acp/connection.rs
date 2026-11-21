@@ -185,6 +185,7 @@ pub struct AcpConnection {
     /// Used to gate agent-specific extension methods.
     pub agent_name: String,
     pub config_options: Vec<ConfigOption>,
+    available_commands: Commands,
     pub last_active: Instant,
     pub activity: Arc<SessionActivity>,
     pub session_reset: bool,
@@ -239,6 +240,25 @@ where
     }
 }
 
+/// The agent's newest slash-command list (ACP `availableCommands`).
+pub(crate) type Commands = Arc<std::sync::Mutex<Option<Value>>>;
+
+/// The list an `available_commands_update` carries. The agent sends one right after `session/new` and
+/// `session/load` return, before any prompt subscribes, so the reader keeps it rather than forwarding it.
+fn command_list(msg: &JsonRpcMessage) -> Option<Value> {
+    if msg.method.as_deref() != Some("session/update") {
+        return None;
+    }
+    let update = msg.params.as_ref()?.get("update")?;
+    if update.get("sessionUpdate")?.as_str()? != "available_commands_update" {
+        return None;
+    }
+    update
+        .get("availableCommands")
+        .filter(|c| c.is_array())
+        .cloned()
+}
+
 /// Reader loop body: reads JSON-RPC messages from `reader`, auto-replies
 /// `session/request_permission` via `writer`, resolves pending responses,
 /// and forwards notifications + stale id-bearing messages to the active
@@ -249,6 +269,7 @@ pub(crate) async fn run_reader_loop<R, W>(
     writer: Arc<Mutex<W>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    commands: Commands,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -328,6 +349,10 @@ pub(crate) async fn run_reader_loop<R, W>(
             // to subscriber forwarding; the adapter recv loop filters by
             // request_id so it can't leak into the next prompt.
             trace!(request_id = id, "stale id-bearing message after abandon");
+        }
+
+        if let Some(list) = command_list(&msg) {
+            *commands.lock().unwrap() = Some(list);
         }
 
         // Notification → forward to subscriber
@@ -492,12 +517,14 @@ impl AcpConnection {
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
+        let available_commands = Commands::default();
 
         let reader_handle = tokio::spawn(run_reader_loop(
             stdout,
             stdin.clone(),
             pending.clone(),
             notify_tx.clone(),
+            available_commands.clone(),
         ));
 
         let activity = Arc::new(SessionActivity::new());
@@ -513,6 +540,7 @@ impl AcpConnection {
             supports_load_session: false,
             agent_name: String::new(),
             config_options: Vec::new(),
+            available_commands,
             last_active: Instant::now(),
             activity,
             session_reset: false,
@@ -531,6 +559,11 @@ impl AcpConnection {
 
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The slash commands the agent last said it offers, as ACP `availableCommands`.
+    pub fn available_commands(&self) -> Option<Value> {
+        self.available_commands.lock().unwrap().clone()
     }
 
     pub(crate) async fn send_raw(&self, data: &str) -> Result<()> {
@@ -1056,6 +1089,7 @@ mod reader_loop_tests {
             writer,
             pending.clone(),
             notify_tx.clone(),
+            Commands::default(),
         ));
 
         let stale = b"{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"stopReason\":\"ok\"}}\n";
@@ -1078,6 +1112,39 @@ mod reader_loop_tests {
     /// adapter's recv loop sees the completion. Guards against regressions
     /// that would suppress the forward branch while keeping resolve.
     #[tokio::test]
+    async fn command_list_is_kept_with_no_prompt_listening() {
+        let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
+        let (agent_stdin_writer, _agent_stdin_reader) = duplex(8 * 1024);
+        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(None));
+        let commands = Commands::default();
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            Arc::new(Mutex::new(agent_stdin_writer)),
+            Arc::new(Mutex::new(HashMap::new())),
+            notify_tx,
+            commands.clone(),
+        ));
+
+        let lines = [
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"compact","description":"Compact","input":null}]}}}"#,
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}}"#,
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"available_commands_update","availableCommands":"not a list"}}}"#,
+        ];
+        for line in lines {
+            agent_stdout_writer
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        drop(agent_stdout_writer);
+        handle.await.unwrap();
+
+        let kept = commands.lock().unwrap().clone().expect("the list is kept");
+        assert_eq!(kept[0]["name"], "compact");
+    }
+
+    #[tokio::test]
     async fn matched_id_response_resolves_pending_and_forwards() {
         let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
         let (agent_stdin_writer, _agent_stdin_reader) = duplex(8 * 1024);
@@ -1099,6 +1166,7 @@ mod reader_loop_tests {
             writer,
             pending.clone(),
             notify_tx.clone(),
+            Commands::default(),
         ));
 
         let payload = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"stopReason\":\"end_turn\"}}\n";
