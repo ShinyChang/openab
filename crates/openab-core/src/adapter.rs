@@ -296,6 +296,39 @@ pub struct SenderContext {
     pub receiver_id: Option<String>,
 }
 
+/// A slash command the agent offers, as a chat client lists it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SlashCommand {
+    pub name: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// The commands in an ACP `availableCommands` list, skipping entries without a name.
+pub fn slash_commands(available: &serde_json::Value) -> Vec<SlashCommand> {
+    let text = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string()
+    };
+    available
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let name = text(c.get("name"));
+            let hint = text(c.get("input").and_then(|i| i.get("hint")));
+            (!name.is_empty()).then(|| SlashCommand {
+                name,
+                description: text(c.get("description")),
+                hint: (!hint.is_empty()).then_some(hint),
+            })
+        })
+        .collect()
+}
+
 // --- ChatAdapter trait ---
 
 #[async_trait]
@@ -345,6 +378,16 @@ pub trait ChatAdapter: Send + Sync + 'static {
 
     /// Rename the thread/channel title. Default: no-op (not all platforms support it).
     async fn rename_thread(&self, _channel: &ChannelRef, _title: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Offer the agent's slash commands, sent after every turn. Default: no-op.
+    async fn offer_commands(
+        &self,
+        _channel: &ChannelRef,
+        _agent: &[SlashCommand],
+        _options: &[crate::acp::protocol::ConfigOption],
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -709,7 +752,9 @@ impl AdapterRouter {
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
 
-        self.pool
+        let (offer_adapter, offer_channel) = (adapter.clone(), thread_channel.clone());
+        let result = self
+            .pool
             .with_connection(thread_key, |conn| {
                 let content_blocks = content_blocks.clone();
                 Box::pin(async move {
@@ -1332,7 +1377,18 @@ impl AdapterRouter {
                     }
                 })
             })
-            .await
+            .await;
+        // After the turn, since the agent sends its list once the session starts, outside any prompt.
+        if let Some(available) = self.pool.get_available_commands(thread_key).await {
+            let options = self.pool.get_config_options(thread_key).await;
+            if let Err(e) = offer_adapter
+                .offer_commands(&offer_channel, &slash_commands(&available), &options)
+                .await
+            {
+                warn!(error = %e, "could not offer the agent's slash commands");
+            }
+        }
+        result
     }
 }
 
@@ -1716,6 +1772,30 @@ fn propagate_mentions_to_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slash_commands_read_acp_available_commands() {
+        let available = serde_json::json!([
+            {"name": "compact", "description": "Compact the conversation", "input": null},
+            {"name": "review", "description": "Review a PR", "input": {"hint": " pr number "}},
+            {"name": "", "description": "nameless"},
+            {"description": "no name at all"},
+            {"name": "bare"}
+        ]);
+        let commands = slash_commands(&available);
+        assert_eq!(commands.len(), 3);
+        assert_eq!(
+            commands[0],
+            SlashCommand {
+                name: "compact".into(),
+                description: "Compact the conversation".into(),
+                hint: None
+            }
+        );
+        assert_eq!(commands[1].hint.as_deref(), Some("pr number"));
+        assert_eq!(commands[2].description, "");
+        assert!(slash_commands(&serde_json::json!({"not": "a list"})).is_empty());
+    }
 
     #[test]
     fn select_delivery_text_send_once_keeps_only_final_block() {

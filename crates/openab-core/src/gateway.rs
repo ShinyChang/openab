@@ -1,5 +1,8 @@
+use crate::acp::protocol::ConfigOption;
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{
+    AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext, SlashCommand,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -508,10 +511,76 @@ async fn handle_config_command(
     }
 }
 
+/// The commands this gateway answers itself, before the agent sees the text, then the agent's own.
+fn gateway_commands(agent: &[SlashCommand], options: &[ConfigOption]) -> Vec<SlashCommand> {
+    let offers = |categories: &[&str]| {
+        options.iter().any(|o| {
+            o.category
+                .as_deref()
+                .is_some_and(|c| categories.contains(&c))
+        })
+    };
+    let own = |name: &str, description: &str, hint: Option<&str>| SlashCommand {
+        name: name.into(),
+        description: description.into(),
+        hint: hint.map(Into::into),
+    };
+    let mut commands = vec![
+        own("cancel", "Stop the reply in progress", None),
+        own(
+            "reset",
+            "Start this conversation over in a new session",
+            None,
+        ),
+    ];
+    if offers(&["model"]) {
+        commands.push(own(
+            "model",
+            "List the models, or switch to one",
+            Some("set <number or name>"),
+        ));
+    }
+    if offers(&["agent", "mode"]) {
+        commands.push(own(
+            "agent",
+            "List the agent modes, or switch to one",
+            Some("set <number or name>"),
+        ));
+    }
+    const ANSWERED_HERE: [&str; 6] = ["cancel", "reset", "model", "models", "agent", "agents"];
+    commands.extend(
+        agent
+            .iter()
+            .filter(|c| !ANSWERED_HERE.contains(&c.name.as_str()))
+            .cloned(),
+    );
+    commands
+}
+
 #[async_trait]
 impl ChatAdapter for GatewayAdapter {
     fn platform(&self) -> &'static str {
         self.platform_name
+    }
+
+    async fn offer_commands(
+        &self,
+        channel: &ChannelRef,
+        agent: &[SlashCommand],
+        options: &[ConfigOption],
+    ) -> Result<()> {
+        let message = serde_json::json!({
+            "schema": "openab.gateway.commands.v1",
+            "platform": channel.platform,
+            "channel": { "id": channel.channel_id, "thread_id": channel.thread_id },
+            "commands": gateway_commands(agent, options),
+        });
+        self.ws_tx
+            .lock()
+            .await
+            .send(Message::Text(message.to_string()))
+            .await?;
+        Ok(())
     }
 
     fn message_limit(&self) -> usize {
@@ -1822,6 +1891,50 @@ fn format_size(n: u64) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn option(category: &str) -> ConfigOption {
+        serde_json::from_value(serde_json::json!({
+            "id": category, "name": category, "category": category, "type": "select",
+            "currentValue": "a", "options": [{"value": "a", "name": "A"}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn gateway_commands_put_its_own_first_and_win_on_a_clash() {
+        let agent = vec![
+            SlashCommand {
+                name: "compact".into(),
+                description: "Compact".into(),
+                hint: None,
+            },
+            SlashCommand {
+                name: "reset".into(),
+                description: "the agent's own reset".into(),
+                hint: None,
+            },
+            SlashCommand {
+                name: "model".into(),
+                description: "the agent's own model".into(),
+                hint: None,
+            },
+        ];
+        let names = |c: &[SlashCommand]| c.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+
+        let bare = gateway_commands(&agent, &[]);
+        assert_eq!(names(&bare), ["cancel", "reset", "compact"]);
+        assert_eq!(
+            bare[1].description,
+            "Start this conversation over in a new session"
+        );
+
+        let both = gateway_commands(&agent, &[option("model"), option("mode")]);
+        assert_eq!(
+            names(&both),
+            ["cancel", "reset", "model", "agent", "compact"]
+        );
+        assert_eq!(both[2].hint.as_deref(), Some("set <number or name>"));
+    }
 
     #[test]
     fn gateway_counts_as_idle_from_the_timeout_on() {
