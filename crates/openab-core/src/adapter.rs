@@ -1379,8 +1379,7 @@ impl AdapterRouter {
             })
             .await;
         // After the turn, since the agent sends its list once the session starts, outside any prompt.
-        if let Some(available) = self.pool.get_available_commands(thread_key).await {
-            let options = self.pool.get_config_options(thread_key).await;
+        if let Some((available, options)) = self.pool.commands_to_offer(thread_key).await {
             if let Err(e) = offer_adapter
                 .offer_commands(&offer_channel, &slash_commands(&available), &options)
                 .await

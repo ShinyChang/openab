@@ -79,6 +79,18 @@ fn platform_supports_streaming(platform: &str) -> bool {
     !NON_EDITABLE_PLATFORMS.contains(&platform)
 }
 
+/// Gateway platforms that take `openab.gateway.commands.v1`. `openab-gateway` reads every frame as a reply,
+/// so the others would log each list as an invalid one.
+///
+/// NOTE: like `EDIT_RESPONSE_PLATFORMS`, this is platform identity standing in for a capability until a
+/// gateway-connect handshake can announce one.
+const COMMAND_LIST_PLATFORMS: &[&str] = &["shy"];
+
+/// Whether `platform` is sent the agent's slash commands. See `COMMAND_LIST_PLATFORMS`.
+fn platform_takes_commands(platform: &str) -> bool {
+    COMMAND_LIST_PLATFORMS.contains(&platform)
+}
+
 /// Gateway attachments arrive as bytes, so a filestore is the only way to hand
 /// the agent a location it can fetch.
 const AUDIO_NO_URL_NOTE: &str =
@@ -569,6 +581,9 @@ impl ChatAdapter for GatewayAdapter {
         agent: &[SlashCommand],
         options: &[ConfigOption],
     ) -> Result<()> {
+        if !platform_takes_commands(&channel.platform) {
+            return Ok(());
+        }
         let message = serde_json::json!({
             "schema": "openab.gateway.commands.v1",
             "platform": channel.platform,
@@ -1950,6 +1965,51 @@ mod tests {
     fn idle_timeout_outlasts_two_missed_pings() {
         // One late pong must not drop a healthy connection.
         assert!(GATEWAY_IDLE_TIMEOUT_SECS > 2 * GATEWAY_PING_INTERVAL_SECS);
+    }
+
+    #[tokio::test]
+    async fn only_shy_is_sent_the_agents_commands() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let gateway = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.next().await.unwrap().unwrap()
+        });
+        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let (tx, _rx) = client.split();
+        let adapter = GatewayAdapter::new(
+            Arc::new(Mutex::new(tx)),
+            Arc::default(),
+            "gateway",
+            false,
+            false,
+            false,
+        );
+        let channel = |platform: &str| ChannelRef {
+            platform: platform.into(),
+            channel_id: "c".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let agent = [SlashCommand {
+            name: "compact".into(),
+            description: "Compact".into(),
+            hint: None,
+        }];
+        for platform in ["telegram", "line", "shy"] {
+            adapter
+                .offer_commands(&channel(platform), &agent, &[])
+                .await
+                .unwrap();
+        }
+        let first: serde_json::Value =
+            serde_json::from_str(gateway.await.unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(first["schema"], "openab.gateway.commands.v1");
+        assert_eq!(first["platform"], "shy");
     }
 
     #[test]

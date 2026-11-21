@@ -553,11 +553,16 @@ impl SessionPool {
         conn.config_options.clone()
     }
 
-    /// The slash commands the session's agent last offered, as ACP `availableCommands`.
-    pub async fn get_available_commands(&self, thread_id: &str) -> Option<serde_json::Value> {
+    /// The slash commands the session's agent last offered, as ACP `availableCommands`, with its config
+    /// options. `None` while anything else holds the connection, so the turn that just ended never waits:
+    /// another turn offers them when it ends, and after a brief holder (the idle sweep) the next turn does.
+    pub async fn commands_to_offer(
+        &self,
+        thread_id: &str,
+    ) -> Option<(serde_json::Value, Vec<ConfigOption>)> {
         let conn = self.state.read().await.active.get(thread_id)?.clone();
-        let conn = conn.lock().await;
-        conn.available_commands()
+        let conn = conn.try_lock().ok()?;
+        Some((conn.available_commands()?, conn.config_options.clone()))
     }
 
     /// Set a config option (e.g. model) via ACP and return updated options.
@@ -1008,5 +1013,56 @@ mod tests {
             roundtrip.get("suspended-thread"),
             Some(&"session-suspended".to_string())
         );
+    }
+
+    /// A turn that ends offers the commands without waiting for the turn queued behind it.
+    #[tokio::test]
+    async fn commands_to_offer_skips_a_connection_in_use() {
+        let listed = r#"printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"compact"}]}}}'; sleep 30"#;
+        let conn = crate::acp::connection::AcpConnection::spawn(
+            "/bin/sh",
+            &["-c".to_string(), listed.to_string()],
+            "/tmp",
+            &HashMap::new(),
+            &[],
+        )
+        .await
+        .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while conn.available_commands().is_none() {
+            assert!(Instant::now() < deadline, "the agent's list never arrived");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let agent = crate::config::AgentConfig {
+            command: "/bin/true".into(),
+            args: vec![],
+            working_dir: "/tmp".into(),
+            env: HashMap::new(),
+            inherit_env: vec![],
+            mcp_servers: vec![],
+            command_explicit: true,
+        };
+        let pool = super::SessionPool::new(agent, 1, 60, HashMap::new());
+        let conn = Arc::new(Mutex::new(conn));
+        pool.state
+            .write()
+            .await
+            .active
+            .insert("t".into(), conn.clone());
+
+        let turn = conn.lock().await;
+        let busy = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            pool.commands_to_offer("t"),
+        )
+        .await
+        .expect("it does not wait for the connection");
+        assert!(busy.is_none());
+        drop(turn);
+        let (list, _) = pool
+            .commands_to_offer("t")
+            .await
+            .expect("offered once the connection is free");
+        assert_eq!(list[0]["name"], "compact");
     }
 }
