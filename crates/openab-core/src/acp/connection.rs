@@ -1107,10 +1107,7 @@ mod reader_loop_tests {
         handle.await.unwrap();
     }
 
-    /// Matched-id path: when a response's id is in `pending`, the loop must
-    /// resolve the oneshot AND forward a copy to the subscriber so the
-    /// adapter's recv loop sees the completion. Guards against regressions
-    /// that would suppress the forward branch while keeping resolve.
+    /// The agent sends its list before any prompt subscribes, so the reader keeps it with nobody listening.
     #[tokio::test]
     async fn command_list_is_kept_with_no_prompt_listening() {
         let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
@@ -1144,6 +1141,10 @@ mod reader_loop_tests {
         assert_eq!(kept[0]["name"], "compact");
     }
 
+    /// Matched-id path: when a response's id is in `pending`, the loop must
+    /// resolve the oneshot AND forward a copy to the subscriber so the
+    /// adapter's recv loop sees the completion. Guards against regressions
+    /// that would suppress the forward branch while keeping resolve.
     #[tokio::test]
     async fn matched_id_response_resolves_pending_and_forwards() {
         let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
