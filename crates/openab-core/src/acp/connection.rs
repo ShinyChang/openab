@@ -1208,6 +1208,7 @@ mod reader_loop_tests {
             Arc::new(Mutex::new(agent_stdin_writer)),
             pending.clone(),
             notify_tx,
+            Commands::default(),
         ));
 
         let request = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"agent/test\",\"params\":{}}\n";
@@ -1252,6 +1253,7 @@ mod reader_loop_tests {
             Arc::new(Mutex::new(agent_stdin_writer)),
             pending.clone(),
             notify_tx,
+            Commands::default(),
         ));
         let mut response_reader = BufReader::new(agent_stdin_reader);
 
@@ -1320,6 +1322,7 @@ mod reader_loop_tests {
             Arc::new(Mutex::new(agent_stdin_writer)),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(None)),
+            Commands::default(),
         ));
         let request_id = (i64::MAX as u64) + 1;
         let request = format!(
@@ -1360,6 +1363,7 @@ mod reader_loop_tests {
             Arc::new(Mutex::new(agent_stdin_writer)),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(None)),
+            Commands::default(),
         ));
         let mut response_reader = BufReader::new(agent_stdin_reader);
 
